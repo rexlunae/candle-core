@@ -32,9 +32,13 @@ __kernel void krecip(__global const float* x, __global float* o, int n) { int i 
 __kernel void kadd(__global const float* a, __global const float* b, __global float* o, int n) { int i = get_global_id(0); if (i < n) o[i] = a[i] + b[i]; }
 __kernel void ksub(__global const float* a, __global const float* b, __global float* o, int n) { int i = get_global_id(0); if (i < n) o[i] = a[i] - b[i]; }
 __kernel void kmul(__global const float* a, __global const float* b, __global float* o, int n) { int i = get_global_id(0); if (i < n) o[i] = a[i] * b[i]; }
-__kernel void kmatmul(__global const float* a, __global const float* b, __global float* o, int M, int N, int K) {
-    int row = get_global_id(0), col = get_global_id(1);
-    if (row < M && col < N) { float acc = 0.0f; for (int k = 0; k < K; k++) acc += a[row*K+k] * b[k*N+col]; o[row*N+col] = acc; }
+// Flat GEMM: one work-item per output element (fast on the Renoir iGPU:
+// ~2ms for a decode matmul, and small banded dispatches stay well under the
+// amdgpu ring-timeout watchdog). `row0` lets the caller split a large (M x N)
+// GEMM into bands so no single submission lingers long enough to be killed.
+__kernel void kmatmul(__global const float* a, __global const float* b, __global float* o, int M, int N, int K, int row0) {
+    int row = row0 + get_global_id(0), col = get_global_id(1);
+    if (row < row0 + M && col < N) { float acc = 0.0f; for (int k = 0; k < K; k++) acc += a[row*K+k] * b[k*N+col]; o[row*N+col] = acc; }
 }
 ";
 
@@ -221,17 +225,31 @@ pub fn run_binary(ctx: usize, dev: usize, queue: usize, op: &str, a: usize, b: u
     Ok(())
 }
 
+/// Max rows per single GEMM submission. Splitting M into bands of this many rows
+/// keeps every submission short enough that the amdgpu compute-ring-timeout
+/// watchdog never declares it hung and hard-recovers the context (the crash
+/// root cause). Empirically a 32-row flat band at H=4096 completes in ~50-90ms,
+/// far below the ~450ms+ single dispatches that were marginal/flaky.
+const M_BAND: usize = 32;
+
 pub fn run_matmul(ctx: usize, dev: usize, queue: usize, a: usize, b: usize, out: usize, (m, n, _k): (usize, usize, usize)) -> Result<()> {
     let program = program_for(ctx, dev)?;
     let k = KernelGuard(create_kernel(program, "kmatmul")?);
-    let (M, N, K, b0, b1, b2) = (m as i32, n as i32, _k as i32, a, b, out);
+    let (N, K, b0, b1, b2) = (n as i32, _k as i32, a, b, out);
     set_arg(k.0, 0, addr_of(&b0), 8)?;
     set_arg(k.0, 1, addr_of(&b1), 8)?;
     set_arg(k.0, 2, addr_of(&b2), 8)?;
-    set_arg(k.0, 3, addr_of(&M), 4)?;
     set_arg(k.0, 4, addr_of(&N), 4)?;
     set_arg(k.0, 5, addr_of(&K), 4)?;
-    run_nd(queue, k.0, &[m.max(1), n.max(1)], 2)?;
+    let mut row0 = 0usize;
+    while row0 < m {
+        let band_m = (m - row0).min(M_BAND);
+        let (BM, R0) = (band_m as i32, row0 as i32);
+        set_arg(k.0, 3, addr_of(&BM), 4)?;
+        set_arg(k.0, 6, addr_of(&R0), 4)?;
+        run_nd(queue, k.0, &[band_m.max(1), n.max(1)], 2)?;
+        row0 += band_m;
+    }
     // k drops here -> clReleaseKernel.
     Ok(())
 }
